@@ -31,8 +31,6 @@ use redis::{aio::ConnectionManager, AsyncCommands, Client, IntoConnectionInfo, R
 /// # RedisSessionStore
 #[derive(Clone)]
 pub struct RedisSessionStore {
-    // Only keeping the Client around for debug since ConnectionManager isn't debug
-    client: Client,
     // TODO: Make this generic <C: ConnectionLike + Clone + Debug + Send + Sync>
     conn: ConnectionManager,
     prefix: Option<String>,
@@ -41,13 +39,25 @@ pub struct RedisSessionStore {
 impl std::fmt::Debug for RedisSessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisSessionStore")
-         .field("client", &self.client)
          .field("prefix", &self.prefix)
          .finish()
     }
 }
 
 impl RedisSessionStore {
+    /// creates a redis store from an existing [`redis::aio::ConnectionManager`]
+    /// ```rust
+    /// # use async_redis_session::RedisSessionStore;
+    /// # tokio_test::block_on(async {
+    /// let client = redis::Client::open("redis://127.0.0.1").unwrap();
+    /// let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    /// let store = RedisSessionStore::from_connection_manager(conn);
+    /// # })
+    /// ```
+    pub fn from_connection_manager(conn: ConnectionManager) -> Self {
+        Self { conn, prefix: None }
+    }
+
     /// creates a redis store from an existing [`redis::Client`]
     /// ```rust
     /// # use async_redis_session::RedisSessionStore;
@@ -57,9 +67,8 @@ impl RedisSessionStore {
     /// # })
     /// ```
     pub async fn from_client(client: Client) -> RedisResult<Self> {
-        let conn = ConnectionManager::new(client.clone()).await?;
+        let conn = ConnectionManager::new(client).await?;
         Ok(Self {
-            client,
             conn,
             prefix: None,
         })
