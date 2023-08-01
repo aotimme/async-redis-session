@@ -2,17 +2,17 @@
 //! ```rust
 //! use async_redis_session::RedisSessionStore;
 //! use async_session::{Session, SessionStore};
-//!
-//! # fn main() -> async_session::Result { async_std::task::block_on(async {
-//! let store = RedisSessionStore::new("redis://127.0.0.1/")?;
+//! 
+//! # tokio_test::block_on(async {
+//! let store = RedisSessionStore::new("redis://127.0.0.1/").await.unwrap();
 //!
 //! let mut session = Session::new();
-//! session.insert("key", "value")?;
+//! session.insert("key", "value").unwrap();
 //!
-//! let cookie_value = store.store_session(session).await?.unwrap();
-//! let session = store.load_session(cookie_value).await?.unwrap();
+//! let cookie_value = store.store_session(session).await.unwrap().unwrap();
+//! let session = store.load_session(cookie_value).await.unwrap().unwrap();
 //! assert_eq!(&session.get::<String>("key").unwrap(), "value");
-//! # Ok(()) }) }
+//! # })
 //! ```
 
 #![forbid(unsafe_code, future_incompatible)]
@@ -26,51 +26,73 @@
 )]
 
 use async_session::{async_trait, serde_json, Result, Session, SessionStore};
-use redis::{aio::Connection, AsyncCommands, Client, IntoConnectionInfo, RedisResult};
+use redis::{aio::ConnectionManager, AsyncCommands, Client, IntoConnectionInfo, RedisResult};
 
 /// # RedisSessionStore
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RedisSessionStore {
+    // Only keeping the Client around for debug since ConnectionManager isn't debug
     client: Client,
+    // TODO: Make this generic <C: ConnectionLike + Clone + Debug + Send + Sync>
+    conn: ConnectionManager,
     prefix: Option<String>,
+}
+
+impl std::fmt::Debug for RedisSessionStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisSessionStore")
+         .field("client", &self.client)
+         .field("prefix", &self.prefix)
+         .finish()
+    }
 }
 
 impl RedisSessionStore {
     /// creates a redis store from an existing [`redis::Client`]
     /// ```rust
     /// # use async_redis_session::RedisSessionStore;
+    /// # tokio_test::block_on(async {
     /// let client = redis::Client::open("redis://127.0.0.1").unwrap();
-    /// let store = RedisSessionStore::from_client(client);
+    /// let store = RedisSessionStore::from_client(client).await.unwrap();
+    /// # })
     /// ```
-    pub fn from_client(client: Client) -> Self {
-        Self {
+    pub async fn from_client(client: Client) -> RedisResult<Self> {
+        let conn = ConnectionManager::new(client.clone()).await?;
+        Ok(Self {
             client,
+            conn,
             prefix: None,
-        }
+        })
     }
 
     /// creates a redis store from a [`redis::IntoConnectionInfo`]
     /// such as a [`String`], [`&str`](str), or [`Url`](../url/struct.Url.html)
     /// ```rust
     /// # use async_redis_session::RedisSessionStore;
-    /// let store = RedisSessionStore::new("redis://127.0.0.1").unwrap();
+    /// # tokio_test::block_on(async {
+    /// let store = RedisSessionStore::new("redis://127.0.0.1").await.unwrap();
+    /// # })
     /// ```
-    pub fn new(connection_info: impl IntoConnectionInfo) -> RedisResult<Self> {
-        Ok(Self::from_client(Client::open(connection_info)?))
+    pub async fn new(connection_info: impl IntoConnectionInfo) -> RedisResult<Self> {
+        Self::from_client(Client::open(connection_info)?).await
     }
 
     /// sets a key prefix for this session store
     ///
     /// ```rust
     /// # use async_redis_session::RedisSessionStore;
-    /// let store = RedisSessionStore::new("redis://127.0.0.1").unwrap()
+    /// # tokio_test::block_on(async {
+    /// let store = RedisSessionStore::new("redis://127.0.0.1").await.unwrap()
     ///     .with_prefix("async-sessions/");
+    /// # })
     /// ```
     /// ```rust
     /// # use async_redis_session::RedisSessionStore;
+    /// # tokio_test::block_on(async {
     /// let client = redis::Client::open("redis://127.0.0.1").unwrap();
-    /// let store = RedisSessionStore::from_client(client)
+    /// let store = RedisSessionStore::from_client(client).await.unwrap()
     ///     .with_prefix("async-sessions/");
+    /// # })
     /// ```
     pub fn with_prefix(mut self, prefix: impl AsRef<str>) -> Self {
         self.prefix = Some(prefix.as_ref().to_owned());
@@ -78,13 +100,13 @@ impl RedisSessionStore {
     }
 
     async fn ids(&self) -> Result<Vec<String>> {
-        Ok(self.connection().await?.keys(self.prefix_key("*")).await?)
+        Ok(self.conn.clone().keys(self.prefix_key("*")).await?)
     }
 
     /// returns the number of sessions in this store
     pub async fn count(&self) -> Result<usize> {
         if self.prefix.is_none() {
-            let mut connection = self.connection().await?;
+            let mut connection = self.conn.clone();
             Ok(redis::cmd("DBSIZE").query_async(&mut connection).await?)
         } else {
             Ok(self.ids().await?.len())
@@ -94,8 +116,7 @@ impl RedisSessionStore {
     #[cfg(test)]
     async fn ttl_for_session(&self, session: &Session) -> Result<usize> {
         Ok(self
-            .connection()
-            .await?
+            .conn.clone()
             .ttl(self.prefix_key(session.id()))
             .await?)
     }
@@ -107,18 +128,13 @@ impl RedisSessionStore {
             key.as_ref().into()
         }
     }
-
-    async fn connection(&self) -> RedisResult<Connection> {
-        self.client.get_async_std_connection().await
-    }
 }
 
 #[async_trait]
 impl SessionStore for RedisSessionStore {
     async fn load_session(&self, cookie_value: String) -> Result<Option<Session>> {
         let id = Session::id_from_cookie_value(&cookie_value)?;
-        let mut connection = self.connection().await?;
-        let record: Option<String> = connection.get(self.prefix_key(id)).await?;
+        let record: Option<String> = self.conn.clone().get(self.prefix_key(id)).await?;
         match record {
             Some(value) => Ok(serde_json::from_str(&value)?),
             None => Ok(None),
@@ -129,7 +145,7 @@ impl SessionStore for RedisSessionStore {
         let id = self.prefix_key(session.id());
         let string = serde_json::to_string(&session)?;
 
-        let mut connection = self.connection().await?;
+        let mut connection = self.conn.clone();
 
         match session.expires_in() {
             None => connection.set(id, string).await?,
@@ -145,14 +161,14 @@ impl SessionStore for RedisSessionStore {
     }
 
     async fn destroy_session(&self, session: Session) -> Result {
-        let mut connection = self.connection().await?;
+        let mut connection = self.conn.clone();
         let key = self.prefix_key(session.id().to_string());
         connection.del(key).await?;
         Ok(())
     }
 
     async fn clear_store(&self) -> Result {
-        let mut connection = self.connection().await?;
+        let mut connection = self.conn.clone();
 
         if self.prefix.is_none() {
             let _: () = redis::cmd("FLUSHDB").query_async(&mut connection).await?;
@@ -169,16 +185,16 @@ impl SessionStore for RedisSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_std::task;
+    use tokio::time;
     use std::time::Duration;
 
     async fn test_store() -> RedisSessionStore {
-        let store = RedisSessionStore::new("redis://127.0.0.1").unwrap();
+        let store = RedisSessionStore::new("redis://127.0.0.1").await.unwrap();
         store.clear_store().await.unwrap();
         store
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn creating_a_new_session_with_no_expiry() -> Result {
         let store = test_store().await;
         let mut session = Session::new();
@@ -194,7 +210,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn updating_a_session() -> Result {
         let store = test_store().await;
         let mut session = Session::new();
@@ -213,7 +229,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn updating_a_session_extending_expiry() -> Result {
         let store = test_store().await;
         let mut session = Session::new();
@@ -237,13 +253,13 @@ mod tests {
 
         assert_eq!(1, store.count().await.unwrap());
 
-        task::sleep(Duration::from_secs(10)).await;
+        time::sleep(Duration::from_secs(10)).await;
         assert_eq!(0, store.count().await.unwrap());
 
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn creating_a_new_session_with_expiry() -> Result {
         let store = test_store().await;
         let mut session = Session::new();
@@ -261,13 +277,13 @@ mod tests {
 
         assert!(!loaded_session.is_expired());
 
-        task::sleep(Duration::from_secs(2)).await;
+        time::sleep(Duration::from_secs(2)).await;
         assert_eq!(None, store.load_session(cookie_value).await?);
 
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn destroying_a_single_session() -> Result {
         let store = test_store().await;
         for _ in 0..3i8 {
@@ -286,7 +302,7 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn clearing_the_whole_store() -> Result {
         let store = test_store().await;
         for _ in 0..3i8 {
@@ -300,11 +316,11 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn prefixes() -> Result {
         test_store().await; // clear the db
 
-        let store = RedisSessionStore::new("redis://127.0.0.1")?.with_prefix("sessions/");
+        let store = RedisSessionStore::new("redis://127.0.0.1").await?.with_prefix("sessions/");
         store.clear_store().await?;
 
         for _ in 0..3i8 {
@@ -326,7 +342,7 @@ mod tests {
         assert_eq!(4, store.count().await.unwrap());
 
         let other_store =
-            RedisSessionStore::new("redis://127.0.0.1")?.with_prefix("other-namespace/");
+            RedisSessionStore::new("redis://127.0.0.1").await?.with_prefix("other-namespace/");
 
         assert_eq!(0, other_store.count().await.unwrap());
         for _ in 0..3i8 {
